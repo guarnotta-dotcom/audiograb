@@ -517,70 +517,13 @@
 </div>
 
 <script>
-  // Dynamically find a working open cobalt instance, then use it for conversion.
-  // Instance list sourced from instances.cobalt.best (community-maintained).
+  const COBALT_INSTANCE = 'https://my-cobalt-a85f.onrender.com';
 
   let selectedQuality = '128';
-  let sessionHistory = []; // in-memory only (no localStorage in this env)
-
-  // ── Cobalt instance discovery ──────────────────────────────────────────────
-  // We try a small hardcoded list of known open instances first, then fall
-  // back to the instances.cobalt.best JSON feed.  Each candidate is probed
-  // with GET / to confirm it is alive and doesn't require auth.
-  const CANDIDATE_INSTANCES = [
-    'https://cobalt.ggtyler.dev',
-    'https://cobalt.drgns.space',
-    'https://cobalt.lunar.icu',
-    'https://co.wuk.sh',
-    'https://cobalt.api.onrender.com',
-  ];
-
-  let _workingInstance = null; // cached after first successful probe
-
-  async function probeInstance(base) {
-    try {
-      const r = await fetch(base + '/', {
-        headers: { Accept: 'application/json' },
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!r.ok) return false;
-      const j = await r.json();
-      // Valid cobalt instance returns { cobalt: { version, ... } }
-      return !!(j && j.cobalt);
-    } catch { return false; }
-  }
+  let sessionHistory = [];
 
   async function getWorkingInstance() {
-    if (_workingInstance) return _workingInstance;
-
-    // 1. Try hardcoded candidates in parallel
-    const probes = CANDIDATE_INSTANCES.map(async (base) => {
-      const ok = await probeInstance(base);
-      return ok ? base : null;
-    });
-    const results = await Promise.all(probes);
-    const found = results.find(r => r !== null);
-    if (found) { _workingInstance = found; return found; }
-
-    // 2. Fall back to instances.cobalt.best API
-    try {
-      const r = await fetch('https://instances.cobalt.best/api/instances.json', {
-        signal: AbortSignal.timeout(6000),
-      });
-      const list = await r.json();
-      // list is an array; pick first online, no-auth, cors-enabled instance
-      for (const inst of list) {
-        if (!inst.online) continue;
-        if (inst.info?.auth) continue;
-        if (!inst.info?.cors) continue;
-        if (!inst.services?.youtube) continue;
-        const base = `${inst.protocol}://${inst.api}`;
-        const ok = await probeInstance(base);
-        if (ok) { _workingInstance = base; return base; }
-      }
-    } catch { /* ignore */ }
-
-    throw new Error('Could not find a working conversion server. Please try again in a moment.');
+    return COBALT_INSTANCE;
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
@@ -658,7 +601,7 @@
       // Metadata + instance discovery in parallel
       const [meta, instanceBase] = await Promise.all([
         getVideoInfo(videoId),
-        (async () => { setStatus('Finding conversion server...', 30); return getWorkingInstance(); })(),
+        (async () => { setStatus('Connecting to server...', 30); return getWorkingInstance(); })(),
       ]);
 
       const title = meta.title || 'YouTube Video';
