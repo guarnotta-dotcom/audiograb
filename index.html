@@ -517,18 +517,78 @@
 </div>
 
 <script>
-  // Uses the free yt-dlp-based API via rapidapi alternative: y2mate-style open endpoint
-  // We'll use the cobalt.tools API which is open-source and free
-  const COBALT_API = 'https://api.cobalt.tools/';
+  // Dynamically find a working open cobalt instance, then use it for conversion.
+  // Instance list sourced from instances.cobalt.best (community-maintained).
 
   let selectedQuality = '128';
-  let history = JSON.parse(localStorage.getItem('ag_history') || '[]');
+  let sessionHistory = []; // in-memory only (no localStorage in this env)
 
+  // ── Cobalt instance discovery ──────────────────────────────────────────────
+  // We try a small hardcoded list of known open instances first, then fall
+  // back to the instances.cobalt.best JSON feed.  Each candidate is probed
+  // with GET / to confirm it is alive and doesn't require auth.
+  const CANDIDATE_INSTANCES = [
+    'https://cobalt.ggtyler.dev',
+    'https://cobalt.drgns.space',
+    'https://cobalt.lunar.icu',
+    'https://co.wuk.sh',
+    'https://cobalt.api.onrender.com',
+  ];
+
+  let _workingInstance = null; // cached after first successful probe
+
+  async function probeInstance(base) {
+    try {
+      const r = await fetch(base + '/', {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!r.ok) return false;
+      const j = await r.json();
+      // Valid cobalt instance returns { cobalt: { version, ... } }
+      return !!(j && j.cobalt);
+    } catch { return false; }
+  }
+
+  async function getWorkingInstance() {
+    if (_workingInstance) return _workingInstance;
+
+    // 1. Try hardcoded candidates in parallel
+    const probes = CANDIDATE_INSTANCES.map(async (base) => {
+      const ok = await probeInstance(base);
+      return ok ? base : null;
+    });
+    const results = await Promise.all(probes);
+    const found = results.find(r => r !== null);
+    if (found) { _workingInstance = found; return found; }
+
+    // 2. Fall back to instances.cobalt.best API
+    try {
+      const r = await fetch('https://instances.cobalt.best/api/instances.json', {
+        signal: AbortSignal.timeout(6000),
+      });
+      const list = await r.json();
+      // list is an array; pick first online, no-auth, cors-enabled instance
+      for (const inst of list) {
+        if (!inst.online) continue;
+        if (inst.info?.auth) continue;
+        if (!inst.info?.cors) continue;
+        if (!inst.services?.youtube) continue;
+        const base = `${inst.protocol}://${inst.api}`;
+        const ok = await probeInstance(base);
+        if (ok) { _workingInstance = base; return base; }
+      }
+    } catch { /* ignore */ }
+
+    throw new Error('Could not find a working conversion server. Please try again in a moment.');
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
   function renderHistory() {
-    if (history.length === 0) { document.getElementById('history-area').style.display = 'none'; return; }
+    if (sessionHistory.length === 0) { document.getElementById('history-area').style.display = 'none'; return; }
     document.getElementById('history-area').style.display = 'block';
     const list = document.getElementById('history-list');
-    list.innerHTML = history.slice(0, 5).map(h => `
+    list.innerHTML = sessionHistory.slice(0, 5).map(h => `
       <div class="history-item">
         <img class="history-thumb" src="${h.thumb}" onerror="this.style.display='none'" alt="">
         <div class="history-meta">
@@ -541,9 +601,8 @@
   }
 
   function saveHistory(title, thumb, url) {
-    history.unshift({ title, thumb, url, date: new Date().toLocaleDateString() });
-    if (history.length > 10) history.pop();
-    localStorage.setItem('ag_history', JSON.stringify(history));
+    sessionHistory.unshift({ title, thumb, url, date: new Date().toLocaleDateString() });
+    if (sessionHistory.length > 10) sessionHistory.pop();
     renderHistory();
   }
 
@@ -574,12 +633,11 @@
   }
 
   async function getVideoInfo(videoId) {
-    // Use noembed for metadata (free, no key needed)
     const res = await fetch(`https://noembed.com/embed?url=https://www.youtube.com/watch?v=${videoId}`);
-    const data = await res.json();
-    return data;
+    return await res.json();
   }
 
+  // ── Main convert flow ──────────────────────────────────────────────────────
   async function startConvert() {
     const url = document.getElementById('url-input').value.trim();
     const btn = document.getElementById('convert-btn');
@@ -594,60 +652,68 @@
 
     btn.disabled = true;
     document.getElementById('status-area').style.display = 'block';
-    setStatus('Fetching video info...', 20);
+    setStatus('Fetching video info...', 15);
 
     try {
-      // Get metadata
-      const meta = await getVideoInfo(videoId);
-      setStatus('Preparing audio conversion...', 50);
+      // Metadata + instance discovery in parallel
+      const [meta, instanceBase] = await Promise.all([
+        getVideoInfo(videoId),
+        (async () => { setStatus('Finding conversion server...', 30); return getWorkingInstance(); })(),
+      ]);
 
       const title = meta.title || 'YouTube Video';
       const thumb = `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
       const authorName = meta.author_name || '';
 
-      // Use cobalt.tools API for conversion
-      setStatus('Requesting MP3 stream...', 70);
+      setStatus('Requesting MP3 stream...', 65);
 
-      const cobaltRes = await fetch(COBALT_API, {
+      // Cobalt v10+ request schema
+      const cobaltRes = await fetch(instanceBase + '/', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Accept': 'application/json'
+          'Accept': 'application/json',
         },
         body: JSON.stringify({
           url: `https://www.youtube.com/watch?v=${videoId}`,
           downloadMode: 'audio',
           audioFormat: 'mp3',
           audioBitrate: selectedQuality,
-          filenameStyle: 'pretty'
-        })
+          filenameStyle: 'pretty',
+        }),
+        signal: AbortSignal.timeout(30000),
       });
 
       if (!cobaltRes.ok) {
-        throw new Error(`Conversion service returned ${cobaltRes.status}. The service may be temporarily unavailable.`);
+        // If this instance failed, clear cache and report
+        _workingInstance = null;
+        const errBody = await cobaltRes.json().catch(() => ({}));
+        throw new Error(errBody?.error?.code || `Server error ${cobaltRes.status} — please try again.`);
       }
 
       const cobaltData = await cobaltRes.json();
-      setStatus('Done!', 100);
 
       if (cobaltData.status === 'error') {
         throw new Error(cobaltData.error?.code || 'Conversion failed. Try a different video.');
       }
 
-      const downloadUrl = cobaltData.url || (cobaltData.tunnel || null);
+      const downloadUrl = cobaltData.url || cobaltData.tunnel || null;
       if (!downloadUrl) {
-        throw new Error('No download URL returned. The video may be unavailable or restricted.');
+        throw new Error('No download link returned. The video may be age-restricted or unavailable.');
       }
+
+      setStatus('Done!', 100);
 
       // Show result
       document.getElementById('result-thumb').src = thumb;
       document.getElementById('result-title').textContent = title + (authorName ? ` · ${authorName}` : '');
       document.getElementById('result-dur').textContent = `mp3 · ${selectedQuality}kbps`;
 
-      // Quality selector
       const qualities = ['64', '128', '256', '320'];
       document.getElementById('quality-row').innerHTML = qualities.map(q => `
-        <div class="quality-btn ${q === selectedQuality ? 'active' : ''}" onclick="selectQuality('${q}', '${url}')">${q}kbps</div>
+        <div class="quality-btn ${q === selectedQuality ? 'active' : ''}" onclick="selectQuality('${q}', '${url.replace(/'/g,"\\'")}')">
+          ${q}kbps
+        </div>
       `).join('');
 
       const dlLink = document.getElementById('download-link');
@@ -669,10 +735,9 @@
   async function selectQuality(q, url) {
     selectedQuality = q;
     document.querySelectorAll('.quality-btn').forEach(b => {
-      b.classList.toggle('active', b.textContent === q + 'kbps');
+      b.classList.toggle('active', b.textContent.trim() === q + 'kbps');
     });
     document.getElementById('result-dur').textContent = `mp3 · ${q}kbps`;
-    // Re-run with new quality
     document.getElementById('url-input').value = url;
     await startConvert();
   }
